@@ -1,0 +1,301 @@
+# Slaganje, testiranje i objava VFA Knjigovodstva.
+#
+# Kod je u privatnom repozitoriju dblazevic21/VFA_knjigovodstvo; ovaj
+# workflow ga preuzme (tajna IZVOR_TOKEN, samo za citanje), slozi pakete i
+# testira ih na pravim strojevima: Windows, Mac (Apple Silicon, Intel,
+# macOS 14) i Linux. Ovdje se objavljuju samo gotovi paketi i zapisi
+# testova - izvorni kod se nikad ne ispisuje ni ne prilaze.
+#
+# Pokretanje: Actions -> Izdanje -> Run workflow. "objavi" = nakon sto svi
+# testovi produ, napravi (ili dopuni) release v<verzija> s paketima i
+# najnovije.json, koji aplikacija cita za automatsko azuriranje.
+name: Izdanje
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Grana ili oznaka u privatnom repozitoriju
+        default: main
+      objavi:
+        description: Objavi release kad svi testovi prodju
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sustav:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ime: windows
+            os: windows-latest
+            rid: win-x64
+            paket: true
+          - ime: mac-apple-silicon
+            os: macos-latest
+            rid: osx-arm64
+            paket: true
+          - ime: mac-intel
+            os: macos-15-intel
+            rid: osx-x64
+            paket: true
+          - ime: mac-14-sonoma
+            os: macos-14
+            rid: osx-arm64
+            paket: false
+          - ime: linux
+            os: ubuntu-24.04
+            rid: linux-x64
+            paket: true
+    name: ${{ matrix.ime }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: izvor
+
+    steps:
+      - name: Kod iz privatnog repozitorija
+        uses: actions/checkout@v4
+        with:
+          repository: dblazevic21/VFA_knjigovodstvo
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.IZVOR_TOKEN }}
+          path: izvor
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Linux - WebKitGTK i virtualni zaslon
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libnotify4 xvfb imagemagick
+
+      - name: Provjere racunanja
+        run: dotnet run --project tests/Provjera -c Release
+
+      - name: Paket (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build/paket.ps1
+
+      - name: Paket (Mac / Linux)
+        if: runner.os != 'Windows'
+        run: bash build/paket.sh ${{ matrix.rid }}
+
+      - name: Gdje je program
+        id: put
+        shell: bash
+        run: |
+          case "${{ matrix.rid }}" in
+            win-*)   echo "exe=publish/win-x64/VfaKnjigovodstvo.exe" >> "$GITHUB_OUTPUT" ;;
+            osx-*)   echo "exe=publish/${{ matrix.rid }}-app/VFA Knjigovodstvo.app/Contents/MacOS/VfaKnjigovodstvo" >> "$GITHUB_OUTPUT" ;;
+            linux-*) echo "exe=publish/linux-x64/VfaKnjigovodstvo" >> "$GITHUB_OUTPUT" ;;
+          esac
+          grep -o '<Version>[^<]*' src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj | sed 's/<Version>/verzija=/' >> "$GITHUB_OUTPUT"
+
+      - name: Proba ispisa (PDF-ovi)
+        shell: bash
+        run: |
+          mkdir -p rezultat/pdf
+          "${{ steps.put.outputs.exe }}" --proba rezultat/pdf tests/Primjer kud
+          grep -q "jednako upisanom: True" rezultat/pdf/12-barkod-procitan.txt
+
+      - name: Funkcionalni testovi (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item tests/Primjer "$env:RUNNER_TEMP/podaci" -Recurse
+          $env:VFA_PODACI = "$env:RUNNER_TEMP/podaci"
+          $p = Start-Process "${{ steps.put.outputs.exe }}" -ArgumentList "--samoprovjera","rezultat/funkcije.json","tests/Sucelje/testovi.js" -PassThru
+          if (-not $p.WaitForExit(480000)) { $p.Kill(); throw "testovi nisu zavrsili" }
+          $j = Get-Content rezultat/funkcije.json -Raw | ConvertFrom-Json
+          $j.testovi | % { "{0} {1} - {2}" -f $(if ($_.ok) { "OK " } else { "PAO" }), $_.ime, $_.detalji }
+          if (-not $j.uspjeh) { throw "palo: $($j.palo -join '; ') $($j.greska)" }
+
+      - name: Funkcionalni testovi (Mac, prozor kao MacBook Air)
+        if: runner.os == 'macOS'
+        run: |
+          cp -R tests/Primjer "$RUNNER_TEMP/podaci"
+          export VFA_PODACI="$RUNNER_TEMP/podaci" VFA_PROZOR=1280x800
+          "${{ steps.put.outputs.exe }}" --samoprovjera rezultat/funkcije.json tests/Sucelje/testovi.js &
+          pid=$!
+          for i in $(seq 1 450); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          if kill -0 $pid 2>/dev/null; then kill $pid; echo "testovi nisu zavrsili"; exit 1; fi
+          python3 -c "import json; j=json.load(open('rezultat/funkcije.json')); [print(('OK ' if t['ok'] else 'PAO'), t['ime'], '-', t['detalji']) for t in j.get('testovi', [])]; print(j.get('greska', '')); exit(0 if j['uspjeh'] else 1)"
+
+      - name: Snimke zaslona svih stranica (Mac, prozor kao MacBook Air M2)
+        if: matrix.ime == 'mac-14-sonoma'
+        timeout-minutes: 10
+        run: |
+          for i in $(seq 1 30); do pgrep -x VfaKnjigovodstvo > /dev/null || break; sleep 1; done
+          rm -rf "$RUNNER_TEMP/podaci3" && cp -R tests/Primjer "$RUNNER_TEMP/podaci3"
+          mkdir -p rezultat/snimke
+          export VFA_PODACI="$RUNNER_TEMP/podaci3" VFA_PROZOR=1470x850 VFA_SNIMKE="$(pwd)/rezultat/snimke"
+          "${{ steps.put.outputs.exe }}" --samoprovjera rezultat/snimke.json tests/Sucelje/snimke.js &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            if [ -f rezultat/snimke/zahtjev.txt ]; then
+              ime=$(cat rezultat/snimke/zahtjev.txt)
+              okvir=$(osascript -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to get {position, size} of window 1" 2>/dev/null | tr -d ' ')
+              if [ -n "$okvir" ]; then screencapture -x -R "$okvir" rezultat/snimke/tmp.png; else screencapture -x rezultat/snimke/tmp.png; fi
+              mv rezultat/snimke/tmp.png "rezultat/snimke/$ime.png"
+              rm -f rezultat/snimke/zahtjev.txt
+            fi
+            sleep 0.2
+          done
+          python3 -c "import json; j=json.load(open('rezultat/snimke.json')); [print(('OK ' if t['ok'] else 'POGLEDAJ'), t['ime'], '-', t['detalji']) for t in j.get('testovi', [])]"
+
+      - name: Dijalog za spremanje ne smrzava aplikaciju (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          for i in $(seq 1 30); do pgrep -x VfaKnjigovodstvo > /dev/null || break; sleep 1; done
+          rm -rf "$RUNNER_TEMP/podaci2" && cp -R tests/Primjer "$RUNNER_TEMP/podaci2"
+          export VFA_PODACI="$RUNNER_TEMP/podaci2"
+          "${{ steps.put.outputs.exe }}" --samoprovjera rezultat/dijalog.json tests/Sucelje/dijalog.js &
+          pid=$!
+          ( for ime in ci-proba ci-slika; do
+              for i in $(seq 1 90); do sleep 1
+                n=$(osascript -e "tell application \"System Events\" to count windows of (first process whose unix id is $pid)" 2>/dev/null || echo 0)
+                if [ "${n:-0}" -gt 1 ]; then
+                  sleep 2
+                  osascript -e 'tell application "System Events" to keystroke "a" using command down' -e "tell application \"System Events\" to keystroke \"$ime\"" -e 'delay 0.5' -e 'tell application "System Events" to key code 36' || true
+                  sleep 3
+                  break
+                fi
+              done
+            done ) &
+          for i in $(seq 1 150); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          if kill -0 $pid 2>/dev/null; then kill -9 $pid; echo "APLIKACIJA SMRZNUTA"; exit 1; fi
+          python3 build/provjeri-spremljeno.py rezultat/dijalog.json
+
+      - name: Funkcionalni testovi (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cp -R tests/Primjer "$RUNNER_TEMP/podaci"
+          export VFA_PODACI="$RUNNER_TEMP/podaci" VFA_PROZOR=1280x800
+          xvfb-run -a -s "-screen 0 1600x1000x24" "${{ steps.put.outputs.exe }}" --samoprovjera rezultat/funkcije.json tests/Sucelje/testovi.js
+          mkdir -p "$HOME/Downloads"
+          xvfb-run -a -s "-screen 0 1600x1000x24" "${{ steps.put.outputs.exe }}" --samoprovjera rezultat/dijalog.json tests/Sucelje/dijalog.js
+          python3 build/provjeri-spremljeno.py rezultat/dijalog.json
+          python3 -c "import json; j=json.load(open('rezultat/funkcije.json')); [print(('OK ' if t['ok'] else 'PAO'), t['ime'], '-', t['detalji']) for t in j.get('testovi', [])]; print(j.get('greska', '')); exit(0 if j['uspjeh'] else 1)"
+
+      # Automatsko azuriranje: instalirana je ova verzija, a ponudi joj se
+      # lazna novija (ista aplikacija, verzija +1). "Azuriraj odmah" mora
+      # zamijeniti program i pokrenuti novu verziju.
+      - name: Automatsko azuriranje (Mac, Linux)
+        if: matrix.ime == 'mac-apple-silicon' || matrix.ime == 'linux'
+        timeout-minutes: 15
+        run: |
+          for i in $(seq 1 30); do pgrep -x VfaKnjigovodstvo > /dev/null || break; sleep 1; done
+          V="${{ steps.put.outputs.verzija }}"
+          N=$(python3 -c "v='$V'.split('.'); v[-1]=str(int(v[-1])+1); print('.'.join(v))")
+          inst="$RUNNER_TEMP/instalirano"; izd="$RUNNER_TEMP/izdanje"
+          rm -rf "$inst" "$izd"; mkdir -p "$inst" "$izd"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ditto -x -k "dist/VfaKnjigovodstvo-$V-mac-apple-silicon.zip" "$inst"
+            program="$inst/VFA Knjigovodstvo.app/Contents/MacOS/VfaKnjigovodstvo"
+            zapis="$HOME/Library/Application Support/VFA Knjigovodstvo/dijagnostika.log"
+          else
+            tar -xzf "dist/VfaKnjigovodstvo-$V-linux-x64.tar.gz" -C "$inst"
+            program="$inst/VfaKnjigovodstvo/VfaKnjigovodstvo"
+            zapis="$HOME/.local/share/vfa-knjigovodstvo/dijagnostika.log"
+          fi
+          # Lazna novija verzija; dist/ ostaje samo s pravim paketom.
+          cp src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj "$RUNNER_TEMP/csproj"
+          sed -i.bak "s:<Version>$V</Version>:<Version>$N</Version>:" src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj
+          bash build/paket.sh ${{ matrix.rid }} > /dev/null
+          mv dist/VfaKnjigovodstvo-$N-* "$izd/"
+          python3 build/najnovije.py "$izd"
+          cp "$RUNNER_TEMP/csproj" src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj
+          rm -f src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj.bak
+          cp -R tests/Primjer "$RUNNER_TEMP/podaci4"
+          export VFA_PODACI="$RUNNER_TEMP/podaci4" VFA_PROZOR=1280x800 VFA_IZDANJA="$izd/najnovije.json"
+          provjeri='
+            "$1" --samoprovjera "$2" tests/Sucelje/azuriranje-odmah.js &
+            pid=$!
+            for i in $(seq 1 120); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+            if kill -0 $pid 2>/dev/null; then echo "STARA VERZIJA SE NIJE ZATVORILA"; kill $pid; exit 1; fi
+            for i in $(seq 1 60); do grep -q "Pokretanje $3 .*nakon azuriranja" "$4" 2>/dev/null && break; sleep 1; done
+            sleep 3
+            pkill -x VfaKnjigovodstvo || true
+            grep "Pokretanje\|Azuriranje" "$4" | tail -8
+            grep -q "Pokretanje $3 .*nakon azuriranja" "$4"'
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            bash -c "$provjeri" _ "$program" rezultat/azuriranje.json "$N" "$zapis"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$inst/VFA Knjigovodstvo.app/Contents/Info.plist"
+            codesign --verify --deep "$inst/VFA Knjigovodstvo.app" && echo "potpis nove verzije ispravan"
+          else
+            xvfb-run -a -s "-screen 0 1600x1000x24" bash -c "$provjeri" _ "$program" rezultat/azuriranje.json "$N" "$zapis"
+          fi
+          test -d "$RUNNER_TEMP/podaci4/kud" && echo "podaci netaknuti"
+
+      - name: Zapisi o greskama
+        if: always()
+        shell: bash
+        run: |
+          for f in publish/*/greska.log publish/*/dijagnostika.log "$HOME/Library/Application Support/VFA Knjigovodstvo/"*.log "$HOME/.local/share/vfa-knjigovodstvo/"*.log; do
+            [ -f "$f" ] && { echo "== $f"; cat "$f"; } || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: provjera-${{ matrix.ime }}
+          path: izvor/rezultat/
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.paket
+        with:
+          name: paket-${{ matrix.ime }}
+          path: |
+            izvor/dist/*.zip
+            izvor/dist/*.tar.gz
+
+  objava:
+    needs: sustav
+    if: ${{ inputs.objavi }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: izvor
+    steps:
+      - name: Kod iz privatnog repozitorija (skripte za izdanje)
+        uses: actions/checkout@v4
+        with:
+          repository: dblazevic21/VFA_knjigovodstvo
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.IZVOR_TOKEN }}
+          path: izvor
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: paket-*
+          merge-multiple: true
+          path: izvor/dist
+
+      - name: Objava
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          V=$(grep -o '<Version>[^<]*' src/VfaKnjigovodstvo/VfaKnjigovodstvo.csproj | sed 's/<Version>//')
+          ls -la dist
+          python3 build/najnovije.py dist
+          python3 build/biljeske.py dist > "$RUNNER_TEMP/biljeske.md"
+          naslov="VFA Knjigovodstvo $V"
+          if gh release view "v$V" -R "$REPO" > /dev/null 2>&1; then
+            gh release upload "v$V" -R "$REPO" --clobber dist/*.zip dist/*.tar.gz dist/najnovije.json
+            gh release edit "v$V" -R "$REPO" --title "$naslov" --notes-file "$RUNNER_TEMP/biljeske.md" --latest --prerelease=false
+          else
+            gh release create "v$V" -R "$REPO" --title "$naslov" --notes-file "$RUNNER_TEMP/biljeske.md" --latest dist/*.zip dist/*.tar.gz dist/najnovije.json
+          fi
+          echo "Objavljeno: https://github.com/$REPO/releases/tag/v$V"
